@@ -1,36 +1,65 @@
+import argparse
 from functools import partial
+import os
 
+import jax
 from jax import numpy as jnp
 from jax import jit, vmap, value_and_grad
 from jax import random
+import numpy as np
 import pickle
 import tensorflow as tf
 import time
+
+from sharpness import batch_sharpness, sharpness
+
+parser = argparse.ArgumentParser()
+parser.add_argument(
+    "--task",
+    choices=["binary47", "full"],
+    default="binary47",
+    help="binary47: digits 4 vs 7 with logistic loss (paper setting); full: 10 classes with cross-entropy loss",
+)
+parser.add_argument(
+    "--sharpness-every",
+    type=int,
+    default=100,
+    help="compute sharpness and batch sharpness every this many steps (multiple of 100; 0 disables)",
+)
+parser.add_argument(
+    "--sharpness-n-samples",
+    type=int,
+    default=None,
+    help="number of training samples (fixed subset) for the full-batch sharpness; default: whole training set",
+)
+parser.add_argument(
+    "--batch-sharpness-n-batches",
+    type=int,
+    default=256,
+    help="number of minibatches (and masks) in the Monte Carlo estimate of the batch sharpness",
+)
+parser.add_argument("--output", default=None, help="path of the pickled logs")
+args = parser.parse_args()
+TASK = args.task
+OUT_SHAPE = () if TASK == "binary47" else (10,)  # shape of the network output
 
 dataset = tf.keras.datasets.mnist.load_data()
 train = dataset[0]
 test = dataset[1]
 
-train_x_seq = train[0].shape[0]
-train_x_len = int(jnp.prod(jnp.array(train[0].shape[1:])))
-test_x_seq = test[0].shape[0]
-test_x_len = int(jnp.prod(jnp.array(test[0].shape[1:])))
 
-train_x = train[0].reshape((train_x_seq, train_x_len)) / 255
-train_y = train[1].reshape(train_x_seq)
-train_mask_47 = jnp.any(jnp.array([train_y == 4, train_y == 7]), axis=0)
-train_x = train_x[train_mask_47]
-train_y = train_y[train_mask_47].astype(float)
-train_y[train_y == 4] = 1.0
-train_y[train_y == 7] = -1.0
+def preprocess(x, y):
+    """Flatten images to [0, 1]-valued vectors; for binary47, keep digits 4 and 7 with labels +1 and -1."""
+    x = x.reshape((x.shape[0], -1)) / 255
+    y = y.astype(float)
+    if TASK == "binary47":
+        keep = (y == 4) | (y == 7)
+        x, y = x[keep], np.where(y[keep] == 4, 1.0, -1.0)
+    return x, y
 
-test_x = test[0].reshape((test_x_seq, test_x_len)) / 255
-test_y = test[1].reshape(test_x_seq)
-test_mask_47 = jnp.any(jnp.array([test_y == 4, test_y == 7]), axis=0)
-test_x = test_x[test_mask_47]
-test_y = test_y[test_mask_47].astype(float)
-test_y[test_y == 4] = 1.0
-test_y[test_y == 7] = -1.0
+
+train_x, train_y = preprocess(*train)
+test_x, test_y = preprocess(*test)
 
 val_size = 2000
 train_x = random.permutation(random.PRNGKey(0), train_x, axis=0)
@@ -41,19 +70,34 @@ train_x_new, train_y_new = train_x[val_size:], train_y[val_size:]
 full_dataset = jnp.concatenate([train_x_new, train_y_new.reshape(-1, 1)], axis=1)
 
 
+def neuron_mask(mask, arr):
+    """Reshape a per-neuron vector of shape (m,) to broadcast against arr of shape (m, ...)."""
+    return mask.reshape(mask.shape + (1,) * (arr.ndim - 1))
+
+
 def network(x, params, mask):
     a, b = params
     m = a.shape[0]
-    a = a * mask
+    a = a * neuron_mask(mask, a)
     return 1 / m * jnp.maximum(b @ x, 0) @ a
 
 
+def loss_from_output(out, y):
+    """Logistic loss (binary47, y in {-1, 1}) or cross-entropy loss (full, y in {0, ..., 9})."""
+    if TASK == "binary47":
+        return jnp.log(1 + jnp.exp(-y * out))
+    return jax.nn.logsumexp(out) - out[y.astype(int)]
+
+
 def logistic_loss(params, x, y, mask):
-    return jnp.log(1 + jnp.exp(-y * network(x, params, mask)))
+    return loss_from_output(network(x, params, mask), y)
 
 
 def accuracy(params, x, y):
-    return y * network(x, params, jnp.ones_like(params[0])) > 0.0
+    out = network(x, params, jnp.ones(params[0].shape[0]))
+    if TASK == "binary47":
+        return y * out > 0.0
+    return jnp.argmax(out) == y
 
 
 batched_logistic_loss = vmap(logistic_loss, in_axes=[None, 0, 0, None])
@@ -74,45 +118,22 @@ def avg_accuracy(params, X, Y):
 
 def init_params(d, m, key):
     subkeys = random.split(key, 2)
-    a = random.normal(subkeys[0], (m,))
+    a = random.normal(subkeys[0], (m,) + OUT_SHAPE)
     b = random.normal(subkeys[1], (m, d)) / jnp.sqrt(d)
     return (a, b)
 
 
-@jit
-def grad_bceloss(y_hat, y):  # implemetns dl/dy_hat
-    return -y * jnp.exp(-y * y_hat) / (1 + jnp.exp(-y * y_hat))
-
-
-@jit
-def grad_forward(x, params, mask):  # implements df/da, df/db
-    a, b = params
-    m = a.shape[0]
-    da = jnp.maximum(b @ x, 0) * mask / m
-    db = jnp.outer(jnp.maximum(jnp.sign(b @ x), 0) * a * mask, x) / m
-    return da, db
-
-
-def grad_forward_backward(params, x, y, for_mask, back_mask):
-    dl_df = grad_bceloss(network(x, params, for_mask), y)
-    df_da, df_db = grad_forward(x, params, back_mask)
-    da = dl_df * df_da
-    db = dl_df * df_db
-    return da, db
-
-
-batched_grad_fb = vmap(
-    grad_forward_backward, in_axes=[None, 0, 0, None, None], out_axes=(0, 0)
-)
+batched_network = vmap(network, in_axes=[0, None, None])
 
 
 @jit
 def grad_fb(params, X, Y, for_mask, back_mask):
-    dA, dB = batched_grad_fb(params, X, Y, for_mask, back_mask)
-    return jnp.mean(dA, axis=0), jnp.mean(dB, axis=0)
-
-
-batched_network = vmap(network, in_axes=[0, None, None])
+    """Average gradient where dl/df is evaluated at the output of the network masked by for_mask,
+    and df/dparams is the derivative of the network masked by back_mask."""
+    n = X.shape[0]
+    dl_df = vmap(jax.grad(loss_from_output))(batched_network(X, params, for_mask), Y)
+    _, df_dparams_vjp = jax.vjp(lambda prm: batched_network(X, prm, back_mask), params)
+    return df_dparams_vjp(dl_df / n)[0]
 
 
 @partial(jit, static_argnames=["batch_size", "p", "d", "m"])
@@ -139,15 +160,15 @@ def masked_sgd_step(params, full_dataset, batch_size, p, key, step_size, m, d):
     batch = random.choice(subkeys[0], full_dataset, shape=(batch_size,), replace=False)
     batch_X = batch[:, :d]
     batch_y = batch[:, -1]
-    mask = random.bernoulli(subkeys[1], 1 - p, shape=(m, 1)) / (1 - p)
+    mask = random.bernoulli(subkeys[1], 1 - p, shape=(m,)) / (1 - p)
     loss_value, grads = value_and_grad(avg_logistic_loss)(
         params, batch_X, batch_y, jnp.ones(m)
     )
     a, b = params
     da, db = grads
     return loss_value, (
-        a - step_size * mask.reshape(da.shape) * da,
-        b - step_size * mask * db,
+        a - step_size * neuron_mask(mask, da) * da,
+        b - step_size * neuron_mask(mask, db) * db,
     )
 
 
@@ -236,6 +257,32 @@ logs = {
     "Val risk for-back": [],
 }
 
+# Curvature diagnostics (see sharpness.py), logged every args.sharpness_every steps and NaN at the other logged steps.
+# "Batch sharpness": expectation over minibatches only, loss without dropout.
+# "Dropout batch sharpness": expectation over minibatches and dropout masks (rate p of the run, also for "zero").
+log_every = 100
+assert args.sharpness_every % log_every == 0
+VARIANTS = ["zero", "dropout", "row", "forward", "for-back"]
+CURVATURE_KEYS = [
+    "Sharpness",
+    "Batch sharpness",
+    "Batch sharpness stderr",
+    "Dropout batch sharpness",
+    "Dropout batch sharpness stderr",
+]
+for curvature_key in CURVATURE_KEYS:
+    for variant in VARIANTS:
+        logs[curvature_key + " " + variant] = []
+
+# Fixed subset of the training set on which the full-batch sharpness is computed (train_x_new is already shuffled).
+sharpness_x = train_x_new[: args.sharpness_n_samples]
+sharpness_y = train_y_new[: args.sharpness_n_samples]
+
+output_path = args.output or (
+    "logs/mnist_exp.pkl" if TASK == "binary47" else "logs/mnist_exp_full.pkl"
+)
+os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+
 for k, param_dict in enumerate([params_4000_large_tau_new]):
     m = param_dict["m"]
     num_steps = param_dict["num_steps"]
@@ -257,9 +304,9 @@ for k, param_dict in enumerate([params_4000_large_tau_new]):
             start = time.time()
 
             step_size = tau * m
-            log_every = 100
             subkeys = random.split(keys[repeat], 2)
             subkeys_train = random.split(subkeys[1], num_steps)
+            eigvecs = {variant: None for variant in VARIANTS}  # warm starts for Lanczos
 
             params_zero = init_params(d, m, subkeys[0])
             params_dropout = init_params(d, m, subkeys[0])
@@ -346,9 +393,9 @@ for k, param_dict in enumerate([params_4000_large_tau_new]):
                             loss_value_forward,
                             loss_value_fb,
                         ],
-                        ["zero", "dropout", "row", "forward", "for-back"],
+                        VARIANTS,
                     ):
-                        ones_mask = jnp.ones_like(params[0])
+                        ones_mask = jnp.ones(m)
                         full_train_risk = avg_logistic_loss(
                             params, train_x_new, train_y_new, ones_mask
                         )
@@ -365,6 +412,34 @@ for k, param_dict in enumerate([params_4000_large_tau_new]):
                         logs["Test accuracy " + variant].append(float(test_acc))
                         logs["Val risk " + variant].append(float(val_risk))
 
+                        if args.sharpness_every and (step + 1) % args.sharpness_every == 0:
+                            # Same minibatches and masks for all variants at a given step.
+                            key_curvature = random.fold_in(subkeys[1], step)
+                            sharp, eigvecs[variant] = sharpness(
+                                avg_logistic_loss,
+                                params,
+                                sharpness_x,
+                                sharpness_y,
+                                v0=eigvecs[variant],
+                            )
+                            curvatures = [sharp]
+                            for p_curvature in [0.0, p]:
+                                curvatures += batch_sharpness(
+                                    avg_logistic_loss,
+                                    params,
+                                    full_dataset,
+                                    batch_size,
+                                    p_curvature,
+                                    key_curvature,
+                                    args.batch_sharpness_n_batches,
+                                    d,
+                                    m,
+                                )
+                        else:
+                            curvatures = [float("nan")] * len(CURVATURE_KEYS)
+                        for curvature_key, value in zip(CURVATURE_KEYS, curvatures):
+                            logs[curvature_key + " " + variant].append(float(value))
+
                 if (step + 1) % (100 * log_every) == 0:
                     print(
                         "Step {}/{} for 4 variants in {} seconds".format(
@@ -374,5 +449,5 @@ for k, param_dict in enumerate([params_4000_large_tau_new]):
                     start = time.time()
 
             print("Dumping logs")
-            with open("logs/mnist_exp.pkl", "wb") as handle:
+            with open(output_path, "wb") as handle:
                 pickle.dump(logs, handle, protocol=pickle.HIGHEST_PROTOCOL)
