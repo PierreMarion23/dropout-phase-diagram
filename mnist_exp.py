@@ -27,10 +27,22 @@ parser.add_argument(
     help="compute sharpness and batch sharpness every this many steps (multiple of 100; 0 disables)",
 )
 parser.add_argument(
+    "--sharpness-repeats",
+    type=int,
+    default=None,
+    help="compute the curvature diagnostics only for the first this many repeats; default: all",
+)
+parser.add_argument(
     "--sharpness-n-samples",
     type=int,
     default=None,
     help="number of training samples (fixed subset) for the full-batch sharpness; default: whole training set",
+)
+parser.add_argument(
+    "--lanczos-iters",
+    type=int,
+    default=15,
+    help="number of Lanczos iterations (Hessian-vector products) for the sharpness, warm-started from the previous one",
 )
 parser.add_argument(
     "--batch-sharpness-n-batches",
@@ -412,7 +424,11 @@ for k, param_dict in enumerate([params_4000_large_tau_new]):
                         logs["Test accuracy " + variant].append(float(test_acc))
                         logs["Val risk " + variant].append(float(val_risk))
 
-                        if args.sharpness_every and (step + 1) % args.sharpness_every == 0:
+                        if (
+                            args.sharpness_every
+                            and (step + 1) % args.sharpness_every == 0
+                            and (args.sharpness_repeats is None or repeat < args.sharpness_repeats)
+                        ):
                             # Same minibatches and masks for all variants at a given step.
                             key_curvature = random.fold_in(subkeys[1], step)
                             sharp, eigvecs[variant] = sharpness(
@@ -420,6 +436,7 @@ for k, param_dict in enumerate([params_4000_large_tau_new]):
                                 params,
                                 sharpness_x,
                                 sharpness_y,
+                                n_iter=args.lanczos_iters,
                                 v0=eigvecs[variant],
                             )
                             curvatures = [sharp]

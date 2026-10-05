@@ -35,4 +35,6 @@ Options of `mnist_exp.py`:
   - `Dropout batch sharpness <variant>`: the same with the expectation over minibatches and dropout masks, g and H being the gradient and Hessian of the dropout minibatch loss;
   - the standard errors of the two Monte Carlo estimates (over `--batch-sharpness-n-batches` draws, default 256).
 
-  These columns are NaN at the other logged steps.
+  These columns are NaN at the other logged steps, and for the repeats beyond `--sharpness-repeats` (default: all).
+
+  The sharpness costs `--lanczos-iters` (default 15) Hessian-vector products on the training set per variant and measurement, warm-started from the previous eigenvector. On a width-4000 network trained for 3000 steps on real MNIST, 15 iterations matched a tight-tolerance reference to float32 precision on both tasks, with or without warm start; 10 warm-started iterations were within 3e-6 (relative). The main levers on the total cost are `--sharpness-every` and `--sharpness-repeats`. Computing the sharpness on a subset (`--sharpness-n-samples`) is cheaper but biased: on the 10-class task, subsets of 4096, 8192 and 16384 samples changed it by -11%, -0.3% and -2.4%.
