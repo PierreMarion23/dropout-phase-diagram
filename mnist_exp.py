@@ -23,7 +23,7 @@ parser.add_argument(
 parser.add_argument(
     "--sharpness-every",
     type=int,
-    default=100,
+    default=200,
     help="compute sharpness and batch sharpness every this many steps (multiple of 100; 0 disables)",
 )
 parser.add_argument(
@@ -50,14 +50,49 @@ parser.add_argument(
     default=256,
     help="number of minibatches (and masks) in the Monte Carlo estimate of the batch sharpness",
 )
+parser.add_argument(
+    "--variants",
+    nargs="+",
+    choices=[
+        "zero",
+        "dropout",
+        "row",
+        "forward",
+        "for-back",
+        "penalty",
+        "row-penalty",
+        "forward-penalty",
+        "for-back-penalty",
+    ],
+    default=["zero", "dropout", "row", "forward", "for-back", "penalty", "for-back-penalty"],
+    help="training variants to run (see the step functions); for-back-penalty is the right-hand side of the "
+    "decomposition of the dropout update in Section 4.1 of the paper",
+)
+parser.add_argument(
+    "--penalty-coefficient",
+    choices=["exact", "paper"],
+    default="exact",
+    help="coefficient of the penalty term (see grad_penalty): exact, (1 + eta_i)(eta_i - eta~_i), for which each "
+    "neuron moves as under dropout; paper, eta_i (eta_i - eta~_i), as written in Section 4.1 of the submitted paper",
+)
+parser.add_argument(
+    "--num-steps",
+    type=int,
+    default=40000,
+    help="number of training steps (Figure 2 of the paper: 40000, Figure 7: 20000)",
+)
 parser.add_argument("--output", default=None, help="path of the pickled logs")
 args = parser.parse_args()
 TASK = args.task
 OUT_SHAPE = () if TASK == "binary47" else (10,)  # shape of the network output
 
-dataset = tf.keras.datasets.mnist.load_data()
-train = dataset[0]
-test = dataset[1]
+# dataset = tf.keras.datasets.mnist.load_data()
+# train = dataset[0]
+# test = dataset[1]
+print("before loading")
+with np.load("mnist.npz") as f:
+    train = (f["x_train"], f["y_train"])
+    test = (f["x_test"], f["y_test"])
 
 
 def preprocess(x, y):
@@ -212,12 +247,85 @@ def forward_sgd_step(params, full_dataset, batch_size, p, key, step_size, m, d):
     return loss_value, (a - step_size * da, b - step_size * db)
 
 
+def neuron_outputs(x, params):
+    """Outputs phi_i(x) = a_i relu(b_i . x) of the individual neurons, of shape (m,) + OUT_SHAPE."""
+    a, b = params
+    return neuron_mask(jnp.maximum(b @ x, 0), a) * a
+
+
+@jit
+def grad_penalty(params, X, Y, for_mask, back_mask):
+    """Penalty term of the decomposition of the dropout update (Section 4.1 of the paper), as a gradient.
+
+    With eta = back_mask - 1, eta~ = for_mask - 1 and f~ the output of the network masked by for_mask, the step
+    moves neuron i by
+        - step_size / m * w_i * 1/n sum_s Dphi_i(x_s)^T [l'(f~_s + (eta_i - eta~_i) phi_i(x_s) / m) - l'(f~_s)],
+    where l' is the derivative of the loss with respect to the output. For the squared loss, this is
+        - step_size / m^2 * w_i (eta_i - eta~_i) * 1/n sum_s Dphi_i(x_s)^T phi_i(x_s).
+    - exact (default), w_i = 1 + eta_i: added to the update of PN + RaM with the same masks, the term replaces the
+      forward mask of neuron i by its backward mask in the update of neuron i. Each neuron then moves exactly as under
+      dropout, and only the dependence between neurons differs: neuron i sees the forward mask eta~_j of neuron j,
+      while neuron j moves with its backward mask eta_j.
+    - paper, w_i = eta_i, as in Section 4.1 of the submitted paper: w_i (eta_i - eta~_i) has the same mean p / (1 - p)
+      but a different law, and a dropped neuron (eta_i = -1) still moves.
+    """
+    n, m = X.shape[0], params[0].shape[0]
+    phi, phi_vjp = jax.vjp(lambda prm: vmap(neuron_outputs, in_axes=[0, None])(X, prm), params)
+    out = batched_network(X, params, for_mask)
+    dloss = jax.grad(loss_from_output)
+    shifted_out = out[:, None] + neuron_mask((back_mask - for_mask) / m, phi[0]) * phi
+    dloss_diff = vmap(vmap(dloss, in_axes=[0, None]))(shifted_out, Y) - vmap(dloss)(out, Y)[:, None]
+    weight = back_mask - 1 if args.penalty_coefficient == "paper" else back_mask
+    return phi_vjp(neuron_mask(weight, phi[0]) * dloss_diff / (n * m))[0]
+
+
+@partial(jit, static_argnames=["batch_size", "p", "d", "m", "forward", "backward"])
+def penalty_sgd_step(params, full_dataset, batch_size, p, key, step_size, m, d, forward, backward):
+    """Step of fb_sgd_step, with the masks applied only in the forward and/or backward pass as requested, plus the
+    penalty term of grad_penalty, built from the same two masks.
+
+    With forward and backward, the update is PN + RaM + penalty, that is the right-hand side of the decomposition
+    of Section 4.1 with the joint law of its terms. Dropout (sgd_step) is the left-hand side.
+    The backward mask is drawn from the same key as the mask of sgd_step (random.split(key, 3)[i] equals
+    random.split(key, 2)[i] in jax 0.7), so that dropout and this step share the minibatch and the mask with which each
+    neuron moves; with forward and backward, they differ only by the forward masks of the other neurons."""
+    subkeys = random.split(key, 3)
+    batch = random.choice(subkeys[0], full_dataset, shape=(batch_size,), replace=False)
+    batch_X = batch[:, :d]
+    batch_y = batch[:, -1]
+    back_mask = random.bernoulli(subkeys[1], 1 - p, shape=(m,)) / (1 - p)
+    for_mask = random.bernoulli(subkeys[2], 1 - p, shape=(m,)) / (1 - p)
+    ones_mask = jnp.ones(m)
+    for_mask_used = for_mask if forward else ones_mask
+    back_mask_used = back_mask if backward else ones_mask
+    a, b = params
+    da, db = grad_fb(params, batch_X, batch_y, for_mask_used, back_mask_used)
+    pa, pb = grad_penalty(params, batch_X, batch_y, for_mask, back_mask)
+    loss_value = avg_logistic_loss(params, batch_X, batch_y, back_mask_used)
+    return loss_value, (a - step_size * (da + pa), b - step_size * (db + pb))
+
+
+# Step function of each variant, called as step(params, full_dataset, batch_size, p, key, step_size, m, d).
+# The variants share the initialization and the key of each step; "zero" is run with p = 0.
+STEP_FUNCTIONS = {
+    "zero": sgd_step,  # SGD without dropout
+    "dropout": sgd_step,  # standard dropout
+    "row": masked_sgd_step,  # RaM: mask in the backward pass only
+    "forward": forward_sgd_step,  # PN: mask in the forward pass only
+    "for-back": fb_sgd_step,  # PN + RaM: independent masks in the forward and backward passes
+    "penalty": partial(penalty_sgd_step, forward=False, backward=False),
+    "row-penalty": partial(penalty_sgd_step, forward=False, backward=True),
+    "forward-penalty": partial(penalty_sgd_step, forward=True, backward=False),
+    "for-back-penalty": partial(penalty_sgd_step, forward=True, backward=True),
+}
+
+
 d = 784
 batch_size = 64
 
 params_4000_large_tau_new = {  #  WE USE THE LARGE TAU SETTING
     "m": 4000,
-    "num_steps": int(4 * 10**4),  # can be reduced to 20 000 steps
+    "num_steps": args.num_steps,
     "tau": 0.25,  # master learning rate. True LR = tau * m
     "p_values": [0.4, 0.3, 0.2, 0.1],
     "n_repeats": [10],
@@ -237,36 +345,6 @@ logs = {
     "fraction_steps": [],
     "num_steps": [],
     "repeat": [],  # added repeat key
-    "Train risk zero": [],  ############
-    "Full train risk zero": [],
-    "Test risk zero": [],
-    "Train accuracy zero": [],
-    "Test accuracy zero": [],
-    "Val risk zero": [],
-    "Train risk dropout": [],  ############
-    "Full train risk dropout": [],
-    "Test risk dropout": [],
-    "Train accuracy dropout": [],
-    "Test accuracy dropout": [],
-    "Val risk dropout": [],
-    "Train risk row": [],  ##############
-    "Full train risk row": [],
-    "Test risk row": [],
-    "Train accuracy row": [],
-    "Test accuracy row": [],
-    "Val risk row": [],
-    "Train risk forward": [],  ##############
-    "Full train risk forward": [],
-    "Test risk forward": [],
-    "Train accuracy forward": [],
-    "Test accuracy forward": [],
-    "Val risk forward": [],
-    "Train risk for-back": [],  ##############
-    "Full train risk for-back": [],
-    "Test risk for-back": [],
-    "Train accuracy for-back": [],
-    "Test accuracy for-back": [],
-    "Val risk for-back": [],
 }
 
 # Curvature diagnostics (see sharpness.py), logged every args.sharpness_every steps and NaN at the other logged steps.
@@ -274,7 +352,15 @@ logs = {
 # "Dropout batch sharpness": expectation over minibatches and dropout masks (rate p of the run, also for "zero").
 log_every = 100
 assert args.sharpness_every % log_every == 0
-VARIANTS = ["zero", "dropout", "row", "forward", "for-back"]
+VARIANTS = args.variants
+METRIC_KEYS = [
+    "Train risk",  # minibatch loss returned by the step function
+    "Full train risk",
+    "Test risk",
+    "Train accuracy",
+    "Test accuracy",
+    "Val risk",
+]
 CURVATURE_KEYS = [
     "Sharpness",
     "Batch sharpness",
@@ -282,9 +368,9 @@ CURVATURE_KEYS = [
     "Dropout batch sharpness",
     "Dropout batch sharpness stderr",
 ]
-for curvature_key in CURVATURE_KEYS:
+for key in METRIC_KEYS + CURVATURE_KEYS:
     for variant in VARIANTS:
-        logs[curvature_key + " " + variant] = []
+        logs[key + " " + variant] = []
 
 # Fixed subset of the training set on which the full-batch sharpness is computed (train_x_new is already shuffled).
 sharpness_x = train_x_new[: args.sharpness_n_samples]
@@ -320,64 +406,21 @@ for k, param_dict in enumerate([params_4000_large_tau_new]):
             subkeys_train = random.split(subkeys[1], num_steps)
             eigvecs = {variant: None for variant in VARIANTS}  # warm starts for Lanczos
 
-            params_zero = init_params(d, m, subkeys[0])
-            params_dropout = init_params(d, m, subkeys[0])
-            params_row = init_params(d, m, subkeys[0])
-            params_forward = init_params(d, m, subkeys[0])
-            params_fb = init_params(d, m, subkeys[0])
+            params = {variant: init_params(d, m, subkeys[0]) for variant in VARIANTS}
+            loss_values = {}
 
             for step in range(num_steps):
-                loss_value_zero, params_zero = sgd_step(
-                    params_zero,
-                    full_dataset,
-                    batch_size,
-                    0.0,
-                    subkeys_train[step],
-                    step_size,
-                    m,
-                    d,
-                )
-
-                loss_value_dropout, params_dropout = sgd_step(
-                    params_dropout,
-                    full_dataset,
-                    batch_size,
-                    p,
-                    subkeys_train[step],
-                    step_size,
-                    m,
-                    d,
-                )
-                loss_value_row, params_row = masked_sgd_step(
-                    params_row,
-                    full_dataset,
-                    batch_size,
-                    p,
-                    subkeys_train[step],
-                    step_size,
-                    m,
-                    d,
-                )
-                loss_value_forward, params_forward = forward_sgd_step(
-                    params_forward,
-                    full_dataset,
-                    batch_size,
-                    p,
-                    subkeys_train[step],
-                    step_size,
-                    m,
-                    d,
-                )
-                loss_value_fb, params_fb = fb_sgd_step(
-                    params_fb,
-                    full_dataset,
-                    batch_size,
-                    p,
-                    subkeys_train[step],
-                    step_size,
-                    m,
-                    d,
-                )
+                for variant in VARIANTS:
+                    loss_values[variant], params[variant] = STEP_FUNCTIONS[variant](
+                        params[variant],
+                        full_dataset,
+                        batch_size,
+                        0.0 if variant == "zero" else p,
+                        subkeys_train[step],
+                        step_size,
+                        m,
+                        d,
+                    )
                 if (step + 1) % log_every == 0:
                     logs["Step"].append(step + 1)
                     logs["m"].append(m)
@@ -390,31 +433,16 @@ for k, param_dict in enumerate([params_4000_large_tau_new]):
                     logs["num_steps"].append(num_steps)
                     logs["repeat"].append(repeat)
 
-                    for params, loss_value, variant in zip(
-                        [
-                            params_zero,
-                            params_dropout,
-                            params_row,
-                            params_forward,
-                            params_fb,
-                        ],
-                        [
-                            loss_value_zero,
-                            loss_value_dropout,
-                            loss_value_row,
-                            loss_value_forward,
-                            loss_value_fb,
-                        ],
-                        VARIANTS,
-                    ):
+                    for variant in VARIANTS:
+                        params_variant, loss_value = params[variant], loss_values[variant]
                         ones_mask = jnp.ones(m)
                         full_train_risk = avg_logistic_loss(
-                            params, train_x_new, train_y_new, ones_mask
+                            params_variant, train_x_new, train_y_new, ones_mask
                         )
-                        test_risk = avg_logistic_loss(params, test_x, test_y, ones_mask)
-                        full_train_acc = avg_accuracy(params, train_x_new, train_y_new)
-                        test_acc = avg_accuracy(params, test_x, test_y)
-                        val_risk = avg_logistic_loss(params, val_x, val_y, ones_mask)
+                        test_risk = avg_logistic_loss(params_variant, test_x, test_y, ones_mask)
+                        full_train_acc = avg_accuracy(params_variant, train_x_new, train_y_new)
+                        test_acc = avg_accuracy(params_variant, test_x, test_y)
+                        val_risk = avg_logistic_loss(params_variant, val_x, val_y, ones_mask)
                         logs["Train risk " + variant].append(float(loss_value))
                         logs["Full train risk " + variant].append(
                             float(full_train_risk)
@@ -433,7 +461,7 @@ for k, param_dict in enumerate([params_4000_large_tau_new]):
                             key_curvature = random.fold_in(subkeys[1], step)
                             sharp, eigvecs[variant] = sharpness(
                                 avg_logistic_loss,
-                                params,
+                                params_variant,
                                 sharpness_x,
                                 sharpness_y,
                                 n_iter=args.lanczos_iters,
@@ -443,7 +471,7 @@ for k, param_dict in enumerate([params_4000_large_tau_new]):
                             for p_curvature in [0.0, p]:
                                 curvatures += batch_sharpness(
                                     avg_logistic_loss,
-                                    params,
+                                    params_variant,
                                     full_dataset,
                                     batch_size,
                                     p_curvature,
@@ -459,8 +487,8 @@ for k, param_dict in enumerate([params_4000_large_tau_new]):
 
                 if (step + 1) % (100 * log_every) == 0:
                     print(
-                        "Step {}/{} for 4 variants in {} seconds".format(
-                            step + 1, num_steps, time.time() - start
+                        "Step {}/{} for {} variants in {} seconds".format(
+                            step + 1, num_steps, len(VARIANTS), time.time() - start
                         )
                     )
                     start = time.time()
