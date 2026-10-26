@@ -69,13 +69,6 @@ parser.add_argument(
     "decomposition of the dropout update in Section 4.1 of the paper",
 )
 parser.add_argument(
-    "--penalty-coefficient",
-    choices=["exact", "paper"],
-    default="exact",
-    help="coefficient of the penalty term (see grad_penalty): exact, (1 + eta_i)(eta_i - eta~_i), for which each "
-    "neuron moves as under dropout; paper, eta_i (eta_i - eta~_i), as written in Section 4.1 of the submitted paper",
-)
-parser.add_argument(
     "--num-steps",
     type=int,
     default=40000,
@@ -257,17 +250,13 @@ def neuron_outputs(x, params):
 def grad_penalty(params, X, Y, for_mask, back_mask):
     """Penalty term of the decomposition of the dropout update (Section 4.1 of the paper), as a gradient.
 
-    With eta = back_mask - 1, eta~ = for_mask - 1 and f~ the output of the network masked by for_mask, the step
-    moves neuron i by
-        - step_size / m * w_i * 1/n sum_s Dphi_i(x_s)^T [l'(f~_s + (eta_i - eta~_i) phi_i(x_s) / m) - l'(f~_s)],
-    where l' is the derivative of the loss with respect to the output. For the squared loss, this is
-        - step_size / m^2 * w_i (eta_i - eta~_i) * 1/n sum_s Dphi_i(x_s)^T phi_i(x_s).
-    - exact (default), w_i = 1 + eta_i: added to the update of PN + RaM with the same masks, the term replaces the
-      forward mask of neuron i by its backward mask in the update of neuron i. Each neuron then moves exactly as under
-      dropout, and only the dependence between neurons differs: neuron i sees the forward mask eta~_j of neuron j,
-      while neuron j moves with its backward mask eta_j.
-    - paper, w_i = eta_i, as in Section 4.1 of the submitted paper: w_i (eta_i - eta~_i) has the same mean p / (1 - p)
-      but a different law, and a dropped neuron (eta_i = -1) still moves.
+    With eta = back_mask - 1 and eta~ = for_mask - 1, the penalty term of the paper moves neuron i, for the squared
+    loss, by
+        - step_size / m^2 * eta_i (eta_i - eta~_i) * 1/n sum_s Dphi_i(x_s)^T phi_i(x_s).
+    For other losses, (eta_i - eta~_i) phi_i(x_s) / m, which is the change of the residual f~_s - y_s when the forward
+    mask of neuron i is switched from eta~_i to eta_i (f~ is the output of the network masked by for_mask), is replaced
+    by the corresponding change of the derivative l' of the loss with respect to the output:
+        - step_size / m * eta_i * 1/n sum_s Dphi_i(x_s)^T [l'(f~_s + (eta_i - eta~_i) phi_i(x_s) / m) - l'(f~_s)].
     """
     n, m = X.shape[0], params[0].shape[0]
     phi, phi_vjp = jax.vjp(lambda prm: vmap(neuron_outputs, in_axes=[0, None])(X, prm), params)
@@ -275,8 +264,7 @@ def grad_penalty(params, X, Y, for_mask, back_mask):
     dloss = jax.grad(loss_from_output)
     shifted_out = out[:, None] + neuron_mask((back_mask - for_mask) / m, phi[0]) * phi
     dloss_diff = vmap(vmap(dloss, in_axes=[0, None]))(shifted_out, Y) - vmap(dloss)(out, Y)[:, None]
-    weight = back_mask - 1 if args.penalty_coefficient == "paper" else back_mask
-    return phi_vjp(neuron_mask(weight, phi[0]) * dloss_diff / (n * m))[0]
+    return phi_vjp(neuron_mask(back_mask - 1, phi[0]) * dloss_diff / (n * m))[0]
 
 
 @partial(jit, static_argnames=["batch_size", "p", "d", "m", "forward", "backward"])
@@ -287,8 +275,8 @@ def penalty_sgd_step(params, full_dataset, batch_size, p, key, step_size, m, d, 
     With forward and backward, the update is PN + RaM + penalty, that is the right-hand side of the decomposition
     of Section 4.1 with the joint law of its terms. Dropout (sgd_step) is the left-hand side.
     The backward mask is drawn from the same key as the mask of sgd_step (random.split(key, 3)[i] equals
-    random.split(key, 2)[i] in jax 0.7), so that dropout and this step share the minibatch and the mask with which each
-    neuron moves; with forward and backward, they differ only by the forward masks of the other neurons."""
+    random.split(key, 2)[i] in jax 0.7), so that dropout and this step share the minibatch and the backward mask; with
+    forward and backward, their updates differ by the remainder of the decomposition."""
     subkeys = random.split(key, 3)
     batch = random.choice(subkeys[0], full_dataset, shape=(batch_size,), replace=False)
     batch_X = batch[:, :d]
