@@ -63,11 +63,15 @@ parser.add_argument(
         "row-penalty",
         "forward-penalty",
         "for-back-penalty",
+        "for-back-resampled",
+        "penalty-resampled",
     ],
-    default=["zero", "dropout", "row", "forward", "for-back", "penalty", "for-back-penalty"],
-    help="training variants to run (see the step functions); for-back-penalty is the right-hand side of the "
-    "decomposition of the dropout update in Section 4.1 of the paper",
+    default=["zero", "dropout", "row", "forward", "for-back-resampled", "penalty-resampled"],
+    help="training variants to run (see the step functions); for-back-resampled (PN + RaM) and penalty-resampled "
+    "(penalty) follow the decomposition of the dropout update in Section 4.1 of the paper; for-back, penalty, "
+    "row-penalty, forward-penalty and for-back-penalty follow its previous version",
 )
+parser.add_argument("--width", type=int, default=4000, help="number of hidden neurons m (the paper's n)")
 parser.add_argument(
     "--num-steps",
     type=int,
@@ -248,7 +252,7 @@ def neuron_outputs(x, params):
 
 @jit
 def grad_penalty(params, X, Y, for_mask, back_mask):
-    """Penalty term of the decomposition of the dropout update (Section 4.1 of the paper), as a gradient.
+    """Penalty term of the previous version of the decomposition of the dropout update (Section 4.1), as a gradient.
 
     With eta = back_mask - 1 and eta~ = for_mask - 1, the penalty term of the paper moves neuron i, for the squared
     loss, by
@@ -293,6 +297,64 @@ def penalty_sgd_step(params, full_dataset, batch_size, p, key, step_size, m, d, 
     return loss_value, (a - step_size * (da + pa), b - step_size * (db + pb))
 
 
+@jit
+def grad_resampled(params, X, Y, mask, own_mask):
+    """Average dropout gradient where, in the gradient of neuron i, the forward mask of neuron i is replaced by
+    own_mask_i: dl/df is evaluated at f_s + (own_mask_i - mask_i) phi_i(x_s) / m, with f the output of the network
+    masked by mask, and the gradient of neuron i is scaled by mask_i as in dropout.
+
+    With eta = mask - 1 and eta~ = own_mask - 1, this is the PN + RaM part of the decomposition of the dropout update
+    (Section 4.1 of the paper): the forward masks are eta~^{i,j} = eta_j for j != i and eta~^{i,i} = eta~_i."""
+    n, m = X.shape[0], params[0].shape[0]
+    phi, phi_vjp = jax.vjp(lambda prm: vmap(neuron_outputs, in_axes=[0, None])(X, prm), params)
+    out = batched_network(X, params, mask)
+    shifted_out = out[:, None] + neuron_mask((own_mask - mask) / m, phi[0]) * phi
+    dloss = vmap(vmap(jax.grad(loss_from_output), in_axes=[0, None]))(shifted_out, Y)
+    return phi_vjp(neuron_mask(mask, phi[0]) * dloss / (n * m))[0]
+
+
+@partial(jit, static_argnames=["batch_size", "p", "d", "m"])
+def resampled_sgd_step(params, full_dataset, batch_size, p, key, step_size, m, d):
+    """PN + RaM: dropout step where, in the gradient of each neuron, the forward mask of that neuron is replaced by an
+    independent copy (see grad_resampled).
+    The minibatch and the mask are drawn from the same keys as in sgd_step (random.split(key, 3)[i] equals
+    random.split(key, 2)[i] in jax 0.7), so that the updates of dropout and of this step from the same parameters
+    differ by the penalty term only."""
+    subkeys = random.split(key, 3)
+    batch = random.choice(subkeys[0], full_dataset, shape=(batch_size,), replace=False)
+    batch_X = batch[:, :d]
+    batch_y = batch[:, -1]
+    mask = random.bernoulli(subkeys[1], 1 - p, shape=(m,)) / (1 - p)
+    own_mask = random.bernoulli(subkeys[2], 1 - p, shape=(m,)) / (1 - p)
+    a, b = params
+    da, db = grad_resampled(params, batch_X, batch_y, mask, own_mask)
+    loss_value = avg_logistic_loss(params, batch_X, batch_y, mask)
+    return loss_value, (a - step_size * da, b - step_size * db)
+
+
+@partial(jit, static_argnames=["batch_size", "p", "d", "m"])
+def penalty_resampled_sgd_step(params, full_dataset, batch_size, p, key, step_size, m, d):
+    """SGD plus the penalty term of the decomposition of the dropout update (Section 4.1 of the paper), computed at the
+    current parameters as the update of dropout minus the update of PN + RaM (resampled_sgd_step), with the same
+    minibatch and masks. The decomposition is thus exact for any loss. For the squared loss, with eta = mask - 1 and
+    eta~ = own_mask - 1, the penalty term moves neuron i by
+        - step_size / m^2 * (1 + eta_i)(eta_i - eta~_i) * 1/n sum_s Dphi_i(x_s)^T phi_i(x_s)."""
+    subkeys = random.split(key, 3)
+    batch = random.choice(subkeys[0], full_dataset, shape=(batch_size,), replace=False)
+    batch_X = batch[:, :d]
+    batch_y = batch[:, -1]
+    mask = random.bernoulli(subkeys[1], 1 - p, shape=(m,)) / (1 - p)
+    own_mask = random.bernoulli(subkeys[2], 1 - p, shape=(m,)) / (1 - p)
+    a, b = params
+    loss_value, (da, db) = value_and_grad(avg_logistic_loss)(params, batch_X, batch_y, jnp.ones(m))
+    dropout_da, dropout_db = jax.grad(avg_logistic_loss)(params, batch_X, batch_y, mask)
+    resampled_da, resampled_db = grad_resampled(params, batch_X, batch_y, mask, own_mask)
+    return loss_value, (
+        a - step_size * (da + dropout_da - resampled_da),
+        b - step_size * (db + dropout_db - resampled_db),
+    )
+
+
 # Step function of each variant, called as step(params, full_dataset, batch_size, p, key, step_size, m, d).
 # The variants share the initialization and the key of each step; "zero" is run with p = 0.
 STEP_FUNCTIONS = {
@@ -300,6 +362,9 @@ STEP_FUNCTIONS = {
     "dropout": sgd_step,  # standard dropout
     "row": masked_sgd_step,  # RaM: mask in the backward pass only
     "forward": forward_sgd_step,  # PN: mask in the forward pass only
+    "for-back-resampled": resampled_sgd_step,  # PN + RaM: dropout with the own forward mask of each neuron resampled
+    "penalty-resampled": penalty_resampled_sgd_step,  # penalty: SGD + dropout - (PN + RaM)
+    # Previous version of the decomposition (forward mask independent of the backward mask for all neurons).
     "for-back": fb_sgd_step,  # PN + RaM: independent masks in the forward and backward passes
     "penalty": partial(penalty_sgd_step, forward=False, backward=False),
     "row-penalty": partial(penalty_sgd_step, forward=False, backward=True),
@@ -312,7 +377,7 @@ d = 784
 batch_size = 64
 
 params_4000_large_tau_new = {  #  WE USE THE LARGE TAU SETTING
-    "m": 4000,
+    "m": args.width,
     "num_steps": args.num_steps,
     "tau": 0.25,  # master learning rate. True LR = tau * m
     "p_values": [0.4, 0.3, 0.2, 0.1],
